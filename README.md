@@ -1,6 +1,6 @@
-# direwolf_api
+# Dire Wolf API
 
-`direwolf_api` is a small Go service that bridges a Dire Wolf KISS TCP feed to an HTTP API and web UI.
+`Dire Wolf API` is a small Go service that bridges a [Dire Wolf](https://github.com/wb2osz/direwolf) KISS TCP feed to an HTTP API and simple Web UI.
 
 ## Requirements
 
@@ -32,13 +32,13 @@ http://localhost:8080
 Build a native Linux binary with:
 
 ```bash
-go build -o direwolf_api
+go build -o build/direwolf_api
 ```
 
 If you want to be explicit about the target platform:
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o direwolf_api
+GOOS=linux GOARCH=amd64 go build -o build/direwolf_api
 ```
 
 ## Build for Windows
@@ -46,15 +46,7 @@ GOOS=linux GOARCH=amd64 go build -o direwolf_api
 Build a Windows binary with:
 
 ```bash
-GOOS=windows GOARCH=amd64 go build -o direwolf_api.exe
+GOOS=windows GOARCH=amd64 go build -o build/direwolf_api.exe
 ```
 
 This produces a Windows executable named `direwolf_api.exe`.
-
-## Project layout
-
-- `main.go`: application entry point
-- `api/`: HTTP server and web UI
-- `kiss/`: KISS client
-- `ax25/`: AX.25 packet handling
-- `aprs/`: APRS parsing and helpers
