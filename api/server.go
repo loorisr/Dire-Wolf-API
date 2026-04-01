@@ -1,0 +1,541 @@
+// Package api provides the HTTP REST + WebSocket API server.
+package api
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"direwolf_api/aprs"
+	"direwolf_api/ax25"
+	"direwolf_api/kiss"
+)
+
+// ─── Data types ──────────────────────────────────────────────────────────────
+
+// Packet is the enriched data structure stored and served by the API.
+type Packet struct {
+	ID        int64        `json:"id"`
+	Timestamp time.Time    `json:"timestamp"`
+	Port      byte         `json:"port"`
+	RawHex    string       `json:"raw_hex"`
+	Source    string       `json:"source,omitempty"`
+	Dest      string       `json:"dest,omitempty"`
+	Via       string       `json:"via,omitempty"`
+	Path      string       `json:"path,omitempty"`
+	PID       byte         `json:"pid,omitempty"`
+	InfoRaw   string       `json:"info_raw,omitempty"`
+	APRS      *aprs.Packet `json:"aprs,omitempty"`
+	Error     string       `json:"error,omitempty"`
+}
+
+// Stats holds aggregate statistics about received packets.
+type Stats struct {
+	TotalPackets int64     `json:"total_packets"`
+	TotalErrors  int64     `json:"total_errors"`
+	StartTime    time.Time `json:"start_time"`
+	Uptime       string    `json:"uptime"`
+}
+
+// ─── Server ───────────────────────────────────────────────────────────────────
+
+// Server is the combined HTTP REST + WebSocket server.
+type Server struct {
+	addr       string
+	maxPackets int
+	kiss       *kiss.Client
+
+	mu      sync.RWMutex
+	packets []*Packet
+
+	counter int64 // auto-increment packet ID
+	total   int64
+	errors  int64
+
+	startTime time.Time
+
+	wsMu      sync.Mutex
+	wsClients map[*websocket.Conn]bool
+
+	upgrader websocket.Upgrader
+}
+
+// NewServer creates a new Server.
+func NewServer(addr string, maxPackets int, kissClient *kiss.Client) *Server {
+	return &Server{
+		addr:       addr,
+		maxPackets: maxPackets,
+		kiss:       kissClient,
+		wsClients:  make(map[*websocket.Conn]bool),
+		startTime:  time.Now(),
+		upgrader: websocket.Upgrader{
+			// Accept all origins (add your own check in production)
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
+	}
+}
+
+// Start begins processing frames and listening for HTTP connections.
+// It blocks until the context is cancelled.
+func (s *Server) Start(ctx context.Context) error {
+	go s.processFrames(ctx)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/api/packets", s.handlePackets)
+	mux.HandleFunc("/api/packets/", s.handlePacket)
+	mux.HandleFunc("/api/stats", s.handleStats)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/ws", s.handleWS)
+
+	srv := &http.Server{Addr: s.addr, Handler: mux}
+	go func() {
+		<-ctx.Done()
+		srv.Close()
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// ─── Frame processing ─────────────────────────────────────────────────────────
+
+func (s *Server) processFrames(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case frame, ok := <-s.kiss.Frames():
+			if !ok {
+				return
+			}
+			s.ingest(frame)
+		}
+	}
+}
+
+func (s *Server) ingest(frame kiss.Frame) {
+	id := atomic.AddInt64(&s.counter, 1)
+	pkt := &Packet{
+		ID:        id,
+		Timestamp: time.Now(),
+		Port:      frame.Port,
+		RawHex:    hex.EncodeToString(frame.Data),
+	}
+
+	ax25Frame, err := ax25.Decode(frame.Data)
+	if err != nil {
+		pkt.Error = fmt.Sprintf("AX.25: %v", err)
+		atomic.AddInt64(&s.errors, 1)
+	} else {
+		pkt.Source = ax25Frame.Source.String()
+		pkt.Dest = ax25Frame.Destination.String()
+		pkt.Via = ax25Frame.Via()
+		pkt.Path = ax25Frame.Path()
+		pkt.PID = ax25Frame.PID
+		pkt.InfoRaw = string(ax25Frame.Info)
+
+		// APRS uses UI frames with PID 0xF0 (no layer 3)
+		if ax25Frame.Type == "UI" && ax25Frame.PID == 0xF0 {
+			pkt.APRS = aprs.Decode(ax25Frame.Info, pkt.Source, pkt.Dest)
+		}
+	}
+
+	atomic.AddInt64(&s.total, 1)
+	log.Printf("[PKT #%d] %-9s  %s  %s", pkt.ID, pkt.Source, pkt.Path, pkt.InfoRaw)
+
+	s.mu.Lock()
+	s.packets = append(s.packets, pkt)
+	if len(s.packets) > s.maxPackets {
+		s.packets = s.packets[len(s.packets)-s.maxPackets:]
+	}
+	s.mu.Unlock()
+
+	s.broadcast(pkt)
+}
+
+// ─── WebSocket broadcast ──────────────────────────────────────────────────────
+
+func (s *Server) broadcast(pkt *Packet) {
+	data, err := json.Marshal(pkt)
+	if err != nil {
+		return
+	}
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	for conn := range s.wsClients {
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			conn.Close()
+			delete(s.wsClients, conn)
+		}
+	}
+}
+
+// ─── HTTP handlers ────────────────────────────────────────────────────────────
+
+func jsonHeader(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+}
+
+// GET /api/packets?limit=N&offset=N
+func (s *Server) handlePackets(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := 100
+	if l, err := strconv.Atoi(q.Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+	offset := 0
+	if o, err := strconv.Atoi(q.Get("offset")); err == nil && o >= 0 {
+		offset = o
+	}
+
+	s.mu.RLock()
+	all := s.packets
+	s.mu.RUnlock()
+
+	// Return newest-first
+	result := make([]*Packet, 0, limit)
+	for i := len(all) - 1 - offset; i >= 0 && len(result) < limit; i-- {
+		result = append(result, all[i])
+	}
+
+	jsonHeader(w)
+	json.NewEncoder(w).Encode(map[string]any{
+		"packets": result,
+		"total":   len(all),
+		"limit":   limit,
+		"offset":  offset,
+	})
+}
+
+// GET /api/packets/{id}
+func (s *Server) handlePacket(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Path[len("/api/packets/"):]
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	s.mu.RLock()
+	var found *Packet
+	for _, p := range s.packets {
+		if p.ID == id {
+			found = p
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if found == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	jsonHeader(w)
+	json.NewEncoder(w).Encode(found)
+}
+
+// GET /api/stats
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	uptime := time.Since(s.startTime)
+	jsonHeader(w)
+	json.NewEncoder(w).Encode(Stats{
+		TotalPackets: atomic.LoadInt64(&s.total),
+		TotalErrors:  atomic.LoadInt64(&s.errors),
+		StartTime:    s.startTime,
+		Uptime:       uptime.Round(time.Second).String(),
+	})
+}
+
+// GET /api/status
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	state := s.kiss.State()
+	stateStr := []string{"disconnected", "connecting", "connected"}[state]
+	jsonHeader(w)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status": stateStr,
+		"addr":   s.kiss.Addr(),
+	})
+}
+
+// GET /ws – WebSocket endpoint
+func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[WS] upgrade error: %v", err)
+		return
+	}
+
+	s.wsMu.Lock()
+	s.wsClients[conn] = true
+	s.wsMu.Unlock()
+	log.Printf("[WS] client connected: %s", conn.RemoteAddr())
+
+	// Replay last 50 packets so the UI is populated immediately
+	s.mu.RLock()
+	replay := s.packets
+	if len(replay) > 50 {
+		replay = replay[len(replay)-50:]
+	}
+	s.mu.RUnlock()
+	for _, pkt := range replay {
+		data, _ := json.Marshal(pkt)
+		conn.WriteMessage(websocket.TextMessage, data)
+	}
+
+	// Keep reading to detect disconnection
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+
+	s.wsMu.Lock()
+	delete(s.wsClients, conn)
+	s.wsMu.Unlock()
+	conn.Close()
+	log.Printf("[WS] client disconnected: %s", conn.RemoteAddr())
+}
+
+// GET / – Web UI
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, indexHTML)
+}
+
+// ─── Embedded Web UI ─────────────────────────────────────────────────────────
+
+const indexHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Direwolf API</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;height:100vh;display:flex;flex-direction:column}
+header{background:#161b22;border-bottom:1px solid #30363d;padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0}
+header h1{font-size:1.1em;color:#58a6ff}
+#badge{padding:3px 10px;border-radius:12px;font-size:.78em;font-weight:700}
+.connected{background:#1a4731;color:#3fb950}
+.connecting{background:#3d2f00;color:#d29922}
+.disconnected{background:#3d0000;color:#f85149}
+.hdr-stats{display:flex;gap:16px;font-size:.8em;color:#8b949e;margin-left:auto}
+.hdr-stats b{color:#c9d1d9}
+main{display:grid;grid-template-columns:1fr 360px;flex:1;min-height:0}
+#list-pane{overflow-y:auto;border-right:1px solid #30363d}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+th{background:#161b22;color:#8b949e;font-size:.76em;font-weight:600;padding:7px 10px;text-align:left;position:sticky;top:0;border-bottom:1px solid #30363d;z-index:1}
+tr.row{cursor:pointer;border-bottom:1px solid #21262d}
+tr.row:hover{background:#161b22}
+tr.row.sel{background:#1c2d3d}
+td{padding:5px 10px;font-size:.79em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c-id{color:#8b949e;width:46px}
+.c-time{color:#8b949e;width:76px}
+.c-src{color:#79c0ff;width:110px}
+.c-dst{color:#a5d6ff;width:110px}
+.c-type{width:78px}
+.c-info{color:#c9d1d9}
+.badge{padding:1px 6px;border-radius:4px;font-size:.74em;font-weight:700}
+.position{background:#1a4731;color:#3fb950}
+.message{background:#1c2a3a;color:#58a6ff}
+.weather{background:#2d1f3d;color:#bc8cff}
+.status{background:#2d2200;color:#d29922}
+.mic-e{background:#1e1e2e;color:#ff79c6}
+.object,.item,.telemetry,.nmea,.unknown{background:#21262d;color:#8b949e}
+@keyframes flash{from{background:#1c2d3d}to{background:transparent}}
+.new{animation:flash .6s ease}
+#detail{padding:14px;overflow-y:auto;background:#0d1117;font-size:.82em}
+#no-sel{color:#8b949e;text-align:center;margin-top:40px}
+.sec{margin-bottom:14px}
+.sec-title{font-size:.72em;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #21262d;padding-bottom:3px;margin-bottom:7px}
+.kv{display:flex;gap:6px;margin-bottom:3px}
+.k{color:#8b949e;min-width:96px;flex-shrink:0}
+.v{color:#c9d1d9;word-break:break-all}
+#hex{font-size:.73em;color:#8b949e;word-break:break-all;background:#161b22;padding:8px;border-radius:4px;line-height:1.6;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#x1F43A; Direwolf API</h1>
+  <span id="badge" class="disconnected">Disconnected</span>
+  <div class="hdr-stats">
+    <span>Packets: <b id="s-total">0</b></span>
+    <span>Errors: <b id="s-err">0</b></span>
+    <span>Uptime: <b id="s-up">-</b></span>
+  </div>
+</header>
+<main>
+  <div id="list-pane">
+    <table>
+      <thead><tr>
+        <th class="c-id">#</th>
+        <th class="c-time">Time</th>
+        <th class="c-src">Source</th>
+        <th class="c-dst">Dest</th>
+        <th class="c-type">Type</th>
+        <th class="c-info">Info</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+  <div id="detail"><div id="no-sel">Select a packet to inspect it</div><div id="dc" style="display:none"></div></div>
+</main>
+<script>
+const MAX=300;
+let db={};
+let selId=null;
+const badge=document.getElementById('badge');
+const tbody=document.getElementById('tbody');
+const dc=document.getElementById('dc');
+
+function connect(){
+  const proto=location.protocol==='https:'?'wss:':'ws:';
+  const ws=new WebSocket(proto+'//'+location.host+'/ws');
+  ws.onopen=()=>setBadge('connected','Connected');
+  ws.onclose=()=>{setBadge('disconnected','Disconnected');setTimeout(connect,3000);};
+  ws.onmessage=e=>{addPkt(JSON.parse(e.data));refreshStats();};
+}
+
+function setBadge(cls,txt){badge.className=cls;badge.textContent=txt;}
+
+function addPkt(p){
+  db[p.id]=p;
+  let row=document.getElementById('r'+p.id);
+  if(!row){
+    row=document.createElement('tr');
+    row.id='r'+p.id;
+    row.className='row new';
+    row.onclick=()=>inspect(p.id);
+    tbody.insertBefore(row,tbody.firstChild);
+    while(tbody.children.length>MAX)tbody.removeChild(tbody.lastChild);
+  }
+  const t=new Date(p.timestamp).toLocaleTimeString();
+  const typ=p.aprs?p.aprs.type:(p.error?'error':'raw');
+  row.innerHTML=
+    '<td class="c-id">'+p.id+'</td>'+
+    '<td class="c-time">'+t+'</td>'+
+    '<td class="c-src">'+esc(p.source||'?')+'</td>'+
+    '<td class="c-dst">'+esc(p.dest||'?')+'</td>'+
+    '<td class="c-type"><span class="badge '+typ+'">'+esc(typ)+'</span></td>'+
+    '<td class="c-info">'+esc(summary(p))+'</td>';
+  if(selId===p.id)inspect(p.id);
+}
+
+function summary(p){
+  if(p.error)return'['+p.error+']';
+  if(!p.aprs)return p.info_raw||'';
+  const a=p.aprs;
+  if(a.position){let s='lat='+a.position.lat.toFixed(4)+' lon='+a.position.lon.toFixed(4);if(a.position.comment)s+=' '+a.position.comment;return s;}
+  if(a.message)return'To:'+a.message.addressee+' "'+a.message.text+'"';
+  if(a.status)return a.status;
+  if(a.comment)return a.comment;
+  return a.raw||'';
+}
+
+function inspect(id){
+  selId=id;
+  document.querySelectorAll('tr.row').forEach(r=>r.classList.remove('sel'));
+  const row=document.getElementById('r'+id);
+  if(row)row.classList.add('sel');
+  const p=db[id];if(!p)return;
+  document.getElementById('no-sel').style.display='none';
+  dc.style.display='block';
+
+  let h='<div class="sec"><div class="sec-title">AX.25 Frame</div>';
+  h+=kv('#',p.id)+kv('Time',new Date(p.timestamp).toLocaleString());
+  h+=kv('Port',p.port)+kv('Source',p.source||'-')+kv('Dest',p.dest||'-');
+  if(p.via)h+=kv('Via',p.via);
+  if(p.path)h+=kv('Path',p.path);
+  if(p.pid!=null)h+=kv('PID','0x'+p.pid.toString(16).toUpperCase().padStart(2,'0'));
+  if(p.error)h+=kv('Error','<span style="color:#f85149">'+esc(p.error)+'</span>');
+  h+='</div>';
+
+  if(p.info_raw){
+    h+='<div class="sec"><div class="sec-title">Info Field</div>';
+    h+='<div class="v" style="word-break:break-all">'+esc(p.info_raw)+'</div></div>';
+  }
+
+  if(p.aprs){
+    const a=p.aprs;
+    h+='<div class="sec"><div class="sec-title">APRS &mdash; '+a.type+'</div>';
+    if(a.timestamp)h+=kv('Timestamp',new Date(a.timestamp).toLocaleString());
+    if(a.position){
+      const pos=a.position;
+      h+=kv('Latitude',pos.lat.toFixed(6)+'&deg;');
+      h+=kv('Longitude',pos.lon.toFixed(6)+'&deg;');
+      h+=kv('Symbol',esc(pos.symbol));
+      if(pos.speed!=null)h+=kv('Speed',pos.speed.toFixed(1)+' km/h');
+      if(pos.course!=null)h+=kv('Course',pos.course+'&deg;');
+      if(pos.altitude!=null)h+=kv('Altitude',pos.altitude.toFixed(0)+' m');
+      if(pos.comment)h+=kv('Comment',esc(pos.comment));
+    }
+    if(a.message){
+      h+=kv('Addressee',esc(a.message.addressee));
+      if(a.message.is_ack)h+=kv('Type','ACK');
+      else if(a.message.is_rej)h+=kv('Type','REJ');
+      else h+=kv('Text',esc(a.message.text));
+      if(a.message.msg_id)h+=kv('Msg ID',esc(a.message.msg_id));
+    }
+    if(a.status)h+=kv('Status',esc(a.status));
+    if(a.weather){
+      const w=a.weather;
+      if(w.temp!=null)h+=kv('Temperature',w.temp.toFixed(1)+' &deg;C');
+      if(w.wind_speed!=null)h+=kv('Wind',w.wind_speed.toFixed(1)+' km/h');
+      if(w.wind_dir!=null)h+=kv('Wind Dir',w.wind_dir+'&deg;');
+      if(w.wind_gust!=null)h+=kv('Gust',w.wind_gust.toFixed(1)+' km/h');
+      if(w.humidity!=null)h+=kv('Humidity',w.humidity+'%');
+      if(w.pressure!=null)h+=kv('Pressure',w.pressure.toFixed(1)+' hPa');
+      if(w.rain_hour!=null)h+=kv('Rain/h',w.rain_hour.toFixed(2)+' mm');
+    }
+    if(a.telemetry)h+=kv('Telemetry',esc(a.telemetry));
+    if(a.comment)h+=kv('Comment',esc(a.comment));
+    h+='</div>';
+  }
+
+  h+='<div class="sec"><div class="sec-title">Raw Frame (hex)</div>';
+  h+='<div id="hex">'+fmtHex(p.raw_hex)+'</div></div>';
+  dc.innerHTML=h;
+}
+
+function fmtHex(h){
+  let r='',i=0;
+  for(;i<h.length;i+=2){
+    if(i>0&&i%32===0)r+='\n';
+    else if(i>0)r+=' ';
+    r+=h[i]+h[i+1];
+  }
+  return r;
+}
+
+function kv(k,v){return'<div class="kv"><span class="k">'+esc(k)+'</span><span class="v">'+v+'</span></div>';}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+function refreshStats(){
+  fetch('/api/stats').then(r=>r.json()).then(s=>{
+    document.getElementById('s-total').textContent=s.total_packets;
+    document.getElementById('s-err').textContent=s.total_errors;
+    document.getElementById('s-up').textContent=s.uptime;
+  });
+}
+
+connect();
+setInterval(refreshStats,5000);
+</script>
+</body>
+</html>`
