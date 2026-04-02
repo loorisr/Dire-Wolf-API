@@ -2,11 +2,20 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -51,6 +60,9 @@ type Stats struct {
 // Server is the combined HTTP REST + WebSocket server.
 type Server struct {
 	addr       string
+	tlsAddr    string
+	certFile   string
+	keyFile    string
 	maxPackets int
 	kiss       *kiss.Client
 
@@ -70,9 +82,12 @@ type Server struct {
 }
 
 // NewServer creates a new Server.
-func NewServer(addr string, maxPackets int, kissClient *kiss.Client) *Server {
+func NewServer(addr, tlsAddr, certFile, keyFile string, maxPackets int, kissClient *kiss.Client) *Server {
 	return &Server{
 		addr:       addr,
+		tlsAddr:    tlsAddr,
+		certFile:   certFile,
+		keyFile:    keyFile,
 		maxPackets: maxPackets,
 		kiss:       kissClient,
 		wsClients:  make(map[*websocket.Conn]bool),
@@ -102,6 +117,46 @@ func (s *Server) Start(ctx context.Context) error {
 		<-ctx.Done()
 		srv.Close()
 	}()
+
+	if s.tlsAddr != "" {
+		tlsSrv := &http.Server{Addr: s.tlsAddr, Handler: mux}
+		go func() {
+			<-ctx.Done()
+			tlsSrv.Close()
+		}()
+		go func() {
+			var tlsCfg *tls.Config
+			if s.certFile != "" && s.keyFile != "" {
+				cert, err := tls.LoadX509KeyPair(s.certFile, s.keyFile)
+				if err != nil {
+					log.Printf("[TLS] failed to load cert/key: %v", err)
+					return
+				}
+				tlsCfg = &tls.Config{Certificates: []tls.Certificate{cert}}
+			} else {
+				var err error
+				tlsCfg, err = selfSignedTLS()
+				if err != nil {
+					log.Printf("[TLS] failed to generate self-signed cert: %v", err)
+					return
+				}
+				log.Printf("[TLS] self-signed certificate generated")
+				log.Printf("[TLS] *** Open https://localhost%s in your browser and accept the security exception before connecting ***", s.tlsAddr)
+			}
+			// Suppress repetitive "TLS handshake error: bad certificate" spam
+			// (happens until the user accepts the self-signed cert in the browser).
+			tlsSrv.ErrorLog = log.New(&tlsHandshakeFilter{log.Writer()}, "", log.LstdFlags)
+			ln, err := tls.Listen("tcp", s.tlsAddr, tlsCfg)
+			if err != nil {
+				log.Printf("[TLS] listen error: %v", err)
+				return
+			}
+			log.Printf("WSS/HTTPS : https://localhost%s", s.tlsAddr)
+			if err := tlsSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+				log.Printf("[TLS] error: %v", err)
+			}
+		}()
+	}
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
@@ -167,8 +222,65 @@ func (s *Server) ingest(frame kiss.Frame) {
 
 // ─── WebSocket broadcast ──────────────────────────────────────────────────────
 
+// wsPacket is the flat format sent over WebSocket, matching the Python server output.
+type wsPacket struct {
+	Callsign    string  `json:"callsign"`
+	Destination string  `json:"destination"`
+	Path        string  `json:"path,omitempty"`
+	Type        string  `json:"type"`
+	Raw         string  `json:"raw,omitempty"`
+	Timestamp   string  `json:"timestamp"`
+	Latitude    float64 `json:"latitude,omitempty"`
+	Longitude   float64 `json:"longitude,omitempty"`
+	Comment     string  `json:"comment,omitempty"`
+	SymbolTable string  `json:"symbol_table,omitempty"`
+	SymbolCode  string  `json:"symbol_code,omitempty"`
+	Error       string  `json:"error,omitempty"`
+}
+
+func toWSPacket(pkt *Packet) wsPacket {
+	w := wsPacket{
+		Callsign:    pkt.Source,
+		Destination: pkt.Dest,
+		Path:        pkt.Via,
+		Timestamp:   pkt.Timestamp.UTC().Format(time.RFC3339Nano),
+		Error:       pkt.Error,
+	}
+	// Reconstruct TNC2 raw string: SRC>DST[,path]:info
+	if pkt.Source != "" {
+		raw := pkt.Source + ">" + pkt.Dest
+		if pkt.Via != "" {
+			raw += "," + pkt.Via
+		}
+		raw += ":" + pkt.InfoRaw
+		w.Raw = raw
+	}
+	if pkt.APRS != nil {
+		w.Type = string(pkt.APRS.Type)
+		if pkt.APRS.Position != nil {
+			w.Latitude = pkt.APRS.Position.Lat
+			w.Longitude = pkt.APRS.Position.Lon
+			w.Comment = pkt.APRS.Position.Comment
+			if len(pkt.APRS.Position.Symbol) >= 1 {
+				w.SymbolTable = string(pkt.APRS.Position.Symbol[0])
+			}
+			if len(pkt.APRS.Position.Symbol) >= 2 {
+				w.SymbolCode = string(pkt.APRS.Position.Symbol[1])
+			}
+		}
+		if w.Comment == "" {
+			w.Comment = pkt.APRS.Comment
+		}
+	} else if pkt.Error != "" {
+		w.Type = "error"
+	} else {
+		w.Type = "raw"
+	}
+	return w
+}
+
 func (s *Server) broadcast(pkt *Packet) {
-	data, err := json.Marshal(pkt)
+	data, err := json.Marshal(toWSPacket(pkt))
 	if err != nil {
 		return
 	}
@@ -181,6 +293,49 @@ func (s *Server) broadcast(pkt *Packet) {
 			delete(s.wsClients, conn)
 		}
 	}
+}
+
+// ─── TLS helpers ─────────────────────────────────────────────────────────────
+
+// tlsHandshakeFilter is an io.Writer that drops TLS handshake error lines
+// (expected noise when a browser hasn't yet accepted a self-signed cert).
+type tlsHandshakeFilter struct{ w interface{ Write([]byte) (int, error) } }
+
+func (f tlsHandshakeFilter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("TLS handshake error")) {
+		return len(p), nil
+	}
+	return f.w.Write(p)
+}
+
+// selfSignedTLS generates an in-memory self-signed ECDSA certificate valid for
+// localhost / 127.0.0.1 for one year.
+func selfSignedTLS() (*tls.Config, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"direwolf_api"}},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:              []string{"localhost"},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{certDER},
+			PrivateKey:  priv,
+		}},
+	}, nil
 }
 
 // ─── HTTP handlers ────────────────────────────────────────────────────────────
@@ -290,7 +445,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 	for _, pkt := range replay {
-		data, _ := json.Marshal(pkt)
+		data, _ := json.Marshal(toWSPacket(pkt))
 		conn.WriteMessage(websocket.TextMessage, data)
 	}
 
