@@ -39,7 +39,6 @@ type Client struct {
 
 	mu    sync.RWMutex
 	state State
-	conn  net.Conn
 
 	frames chan Frame
 }
@@ -110,18 +109,12 @@ func (c *Client) loop(ctx context.Context) {
 		}
 
 		backoff = time.Second
-		c.mu.Lock()
-		c.conn = conn
-		c.state = StateConnected
-		c.mu.Unlock()
+		c.setState(StateConnected)
 		log.Printf("[KISS] Connected to %s", c.addr)
 
 		c.read(ctx, conn)
 
-		c.mu.Lock()
-		c.conn = nil
-		c.state = StateDisconnected
-		c.mu.Unlock()
+		c.setState(StateDisconnected)
 		log.Printf("[KISS] Disconnected – reconnecting ...")
 	}
 }
@@ -173,7 +166,7 @@ func (c *Client) read(ctx context.Context, conn net.Conn) {
 				case tfesc:
 					frame = append(frame, fesc)
 				default:
-					// protocol violation – keep byte as-is
+					log.Printf("[KISS] protocol violation: unexpected escaped byte 0x%02X", b)
 					frame = append(frame, b)
 				}
 

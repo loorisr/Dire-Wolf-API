@@ -47,7 +47,7 @@ type Message struct {
 	IsRej     bool   `json:"is_rej,omitempty"`
 }
 
-// Weather holds weather observation data (all values in SI units).
+// Weather holds weather observation data.
 type Weather struct {
 	WindDir   *int     `json:"wind_dir,omitempty"`
 	WindSpeed *float64 `json:"wind_speed,omitempty"`
@@ -101,7 +101,7 @@ func convert(fp *fap.Packet, raw string) *Packet {
 		p.Position = &Position{
 			Lat:     derefFloat64(fp.Latitude),
 			Lon:     derefFloat64(fp.Longitude),
-			Symbol:  string([]byte{fp.SymbolTable, fp.SymbolCode}),
+			Symbol:  symbolString(fp.SymbolTable, fp.SymbolCode),
 			Comment: fp.Comment,
 		}
 		if fp.Speed != nil {
@@ -150,14 +150,6 @@ func convert(fp *fap.Packet, raw string) *Packet {
 			status = "live"
 		}
 		p.Comment = fmt.Sprintf("%s [%s]", fp.ObjectName, status)
-		if p.Position == nil && (fp.Latitude != nil || fp.Longitude != nil) {
-			p.Position = &Position{
-				Lat:     derefFloat64(fp.Latitude),
-				Lon:     derefFloat64(fp.Longitude),
-				Symbol:  string([]byte{fp.SymbolTable, fp.SymbolCode}),
-				Comment: fp.Comment,
-			}
-		}
 	}
 
 	if fp.ItemName != "" {
@@ -248,6 +240,13 @@ func formatTelemetry(td *fap.Telemetry) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+func symbolString(table, code byte) string {
+	if table == 0 && code == 0 {
+		return ""
+	}
+	return string([]byte{table, code})
 }
 
 func derefFloat64(v *float64) float64 {

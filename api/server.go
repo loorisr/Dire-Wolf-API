@@ -68,6 +68,7 @@ type Server struct {
 
 	mu      sync.RWMutex
 	packets []*Packet
+	pktByID map[int64]*Packet
 
 	counter int64 // auto-increment packet ID
 	total   int64
@@ -91,6 +92,7 @@ func NewServer(addr, tlsAddr, certFile, keyFile string, maxPackets int, kissClie
 		maxPackets: maxPackets,
 		kiss:       kissClient,
 		wsClients:  make(map[*websocket.Conn]bool),
+		pktByID:   make(map[int64]*Packet),
 		startTime:  time.Now(),
 		upgrader: websocket.Upgrader{
 			// Accept all origins (add your own check in production)
@@ -112,18 +114,26 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/ws", s.handleWS)
 
-	srv := &http.Server{Addr: s.addr, Handler: mux}
+	srv := &http.Server{
+		Addr:         s.addr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		srv.Close()
 	}()
 
 	if s.tlsAddr != "" {
-		tlsSrv := &http.Server{Addr: s.tlsAddr, Handler: mux}
-		go func() {
-			<-ctx.Done()
-			tlsSrv.Close()
-		}()
+		tlsSrv := &http.Server{
+			Addr:         s.tlsAddr,
+			Handler:      mux,
+			ReadTimeout:  10 * time.Second,
+			WriteTimeout: 10 * time.Second,
+			IdleTimeout:  120 * time.Second,
+		}
 		go func() {
 			var tlsCfg *tls.Config
 			if s.certFile != "" && s.keyFile != "" {
@@ -143,14 +153,16 @@ func (s *Server) Start(ctx context.Context) error {
 				log.Printf("[TLS] self-signed certificate generated")
 				log.Printf("[TLS] *** Open https://localhost%s in your browser and accept the security exception before connecting ***", s.tlsAddr)
 			}
-			// Suppress repetitive "TLS handshake error: bad certificate" spam
-			// (happens until the user accepts the self-signed cert in the browser).
 			tlsSrv.ErrorLog = log.New(&tlsHandshakeFilter{log.Writer()}, "", log.LstdFlags)
 			ln, err := tls.Listen("tcp", s.tlsAddr, tlsCfg)
 			if err != nil {
 				log.Printf("[TLS] listen error: %v", err)
 				return
 			}
+			go func() {
+				<-ctx.Done()
+				tlsSrv.Close()
+			}()
 			log.Printf("WSS/HTTPS : https://localhost%s", s.tlsAddr)
 			if err := tlsSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				log.Printf("[TLS] error: %v", err)
@@ -212,7 +224,12 @@ func (s *Server) ingest(frame kiss.Frame) {
 
 	s.mu.Lock()
 	s.packets = append(s.packets, pkt)
+	s.pktByID[pkt.ID] = pkt
 	if len(s.packets) > s.maxPackets {
+		removed := s.packets[:len(s.packets)-s.maxPackets]
+		for _, old := range removed {
+			delete(s.pktByID, old.ID)
+		}
 		s.packets = s.packets[len(s.packets)-s.maxPackets:]
 	}
 	s.mu.Unlock()
@@ -222,66 +239,10 @@ func (s *Server) ingest(frame kiss.Frame) {
 
 // ─── WebSocket broadcast ──────────────────────────────────────────────────────
 
-// wsPacket is the flat format sent over WebSocket, matching the Python server output.
-type wsPacket struct {
-	Callsign    string  `json:"callsign"`
-	Destination string  `json:"destination"`
-	Path        string  `json:"path,omitempty"`
-	Type        string  `json:"type"`
-	Raw         string  `json:"raw,omitempty"`
-	Timestamp   string  `json:"timestamp"`
-	Latitude    float64 `json:"latitude,omitempty"`
-	Longitude   float64 `json:"longitude,omitempty"`
-	Comment     string  `json:"comment,omitempty"`
-	SymbolTable string  `json:"symbol_table,omitempty"`
-	SymbolCode  string  `json:"symbol_code,omitempty"`
-	Error       string  `json:"error,omitempty"`
-}
-
-func toWSPacket(pkt *Packet) wsPacket {
-	w := wsPacket{
-		Callsign:    pkt.Source,
-		Destination: pkt.Dest,
-		Path:        pkt.Via,
-		Timestamp:   pkt.Timestamp.UTC().Format(time.RFC3339Nano),
-		Error:       pkt.Error,
-	}
-	// Reconstruct TNC2 raw string: SRC>DST[,path]:info
-	if pkt.Source != "" {
-		raw := pkt.Source + ">" + pkt.Dest
-		if pkt.Via != "" {
-			raw += "," + pkt.Via
-		}
-		raw += ":" + pkt.InfoRaw
-		w.Raw = raw
-	}
-	if pkt.APRS != nil {
-		w.Type = string(pkt.APRS.Type)
-		if pkt.APRS.Position != nil {
-			w.Latitude = pkt.APRS.Position.Lat
-			w.Longitude = pkt.APRS.Position.Lon
-			w.Comment = pkt.APRS.Position.Comment
-			if len(pkt.APRS.Position.Symbol) >= 1 {
-				w.SymbolTable = string(pkt.APRS.Position.Symbol[0])
-			}
-			if len(pkt.APRS.Position.Symbol) >= 2 {
-				w.SymbolCode = string(pkt.APRS.Position.Symbol[1])
-			}
-		}
-		if w.Comment == "" {
-			w.Comment = pkt.APRS.Comment
-		}
-	} else if pkt.Error != "" {
-		w.Type = "error"
-	} else {
-		w.Type = "raw"
-	}
-	return w
-}
-
 func (s *Server) broadcast(pkt *Packet) {
-	data, err := json.Marshal(toWSPacket(pkt))
+	data, err := json.Marshal(pkt)
 	if err != nil {
+		log.Printf("[WS] marshal error: %v", err)
 		return
 	}
 	s.wsMu.Lock()
@@ -385,13 +346,7 @@ func (s *Server) handlePacket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.RLock()
-	var found *Packet
-	for _, p := range s.packets {
-		if p.ID == id {
-			found = p
-			break
-		}
-	}
+	found := s.pktByID[id]
 	s.mu.RUnlock()
 	if found == nil {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -445,7 +400,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 	for _, pkt := range replay {
-		data, _ := json.Marshal(toWSPacket(pkt))
+		data, err := json.Marshal(pkt)
+		if err != nil {
+			log.Printf("[WS] replay marshal error: %v", err)
+			continue
+		}
 		conn.WriteMessage(websocket.TextMessage, data)
 	}
 
