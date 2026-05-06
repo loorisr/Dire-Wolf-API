@@ -2,6 +2,8 @@
 
 `Dire Wolf API` is a small Go service that bridges a [Dire Wolf](https://github.com/wb2osz/direwolf) KISS TCP feed to an HTTP API and simple Web UI.
 
+See [API.md](API.md) for the full REST and WebSocket API documentation.
+
 ## Requirements
 
 - Go 1.26 or newer
