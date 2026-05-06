@@ -440,6 +440,7 @@ const indexHTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Direwolf API</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;height:100vh;display:flex;flex-direction:column}
@@ -451,31 +452,17 @@ header h1{font-size:1.1em;color:#58a6ff}
 .disconnected{background:#3d0000;color:#f85149}
 .hdr-stats{display:flex;gap:16px;font-size:.8em;color:#8b949e;margin-left:auto}
 .hdr-stats b{color:#c9d1d9}
-main{display:grid;grid-template-columns:1fr 360px;flex:1;min-height:0}
-#list-pane{overflow-y:auto;border-right:1px solid #30363d}
-table{width:100%;border-collapse:collapse;table-layout:fixed}
-th{background:#161b22;color:#8b949e;font-size:.76em;font-weight:600;padding:7px 10px;text-align:left;position:sticky;top:0;border-bottom:1px solid #30363d;z-index:1}
-tr.row{cursor:pointer;border-bottom:1px solid #21262d}
-tr.row:hover{background:#161b22}
-tr.row.sel{background:#1c2d3d}
-td{padding:5px 10px;font-size:.79em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.c-id{color:#8b949e;width:46px}
-.c-time{color:#8b949e;width:76px}
-.c-src{color:#79c0ff;width:110px}
-.c-dst{color:#a5d6ff;width:110px}
-.c-type{width:78px}
-.c-info{color:#c9d1d9}
-.badge{padding:1px 6px;border-radius:4px;font-size:.74em;font-weight:700}
-.position{background:#1a4731;color:#3fb950}
-.message{background:#1c2a3a;color:#58a6ff}
-.weather{background:#2d1f3d;color:#bc8cff}
-.status{background:#2d2200;color:#d29922}
-.mic-e{background:#1e1e2e;color:#ff79c6}
-.object,.item,.telemetry,.nmea,.unknown{background:#21262d;color:#8b949e}
-@keyframes flash{from{background:#1c2d3d}to{background:transparent}}
-.new{animation:flash .6s ease}
-#detail{padding:14px;overflow-y:auto;background:#0d1117;font-size:.82em}
-#no-sel{color:#8b949e;text-align:center;margin-top:40px}
+main{display:flex;flex:1;min-height:0;--right-w:360px;--list-h:55%}
+#map-pane{flex:1;min-width:200px;background:#1a1a2e;position:relative;overflow:hidden}
+#map{width:100%;height:100%}
+#split-v{cursor:col-resize;width:4px;background:#30363d;flex-shrink:0;transition:background .15s}
+#split-v:hover,#split-v.active{background:#58a6ff}
+#right-pane{width:var(--right-w);min-width:200px;display:flex;flex-direction:column;flex-shrink:0}
+#list-pane{overflow-y:auto;height:var(--list-h);min-height:80px}
+#split-h{cursor:row-resize;height:4px;background:#30363d;flex-shrink:0;transition:background .15s}
+#split-h:hover,#split-h.active{background:#58a6ff}
+#detail{padding:14px;overflow-y:auto;background:#0d1117;font-size:.82em;flex:1;min-height:60px}
+#no-sel{color:#8b949e;text-align:center;padding-top:20px}
 .sec{margin-bottom:14px}
 .sec-title{font-size:.72em;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #21262d;padding-bottom:3px;margin-bottom:7px}
 .kv{display:flex;gap:6px;margin-bottom:3px}
@@ -495,21 +482,27 @@ td{padding:5px 10px;font-size:.79em;overflow:hidden;text-overflow:ellipsis;white
   </div>
 </header>
 <main>
-  <div id="list-pane">
-    <table>
-      <thead><tr>
-        <th class="c-id">#</th>
-        <th class="c-time">Time</th>
-        <th class="c-src">Source</th>
-        <th class="c-dst">Dest</th>
-        <th class="c-type">Type</th>
-        <th class="c-info">Info</th>
-      </tr></thead>
-      <tbody id="tbody"></tbody>
-    </table>
+  <div id="map-pane"><div id="map"></div></div>
+  <div id="split-v"></div>
+  <div id="right-pane">
+    <div id="list-pane">
+      <table>
+        <thead><tr>
+          <th class="c-id">#</th>
+          <th class="c-time">Time</th>
+          <th class="c-src">Source</th>
+          <th class="c-dst">Dest</th>
+          <th class="c-type">Type</th>
+          <th class="c-info">Info</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div id="split-h"></div>
+    <div id="detail"><div id="no-sel">Select a packet to inspect it</div><div id="dc" style="display:none"></div></div>
   </div>
-  <div id="detail"><div id="no-sel">Select a packet to inspect it</div><div id="dc" style="display:none"></div></div>
 </main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const MAX=300;
 let db={};
@@ -517,6 +510,69 @@ let selId=null;
 const badge=document.getElementById('badge');
 const tbody=document.getElementById('tbody');
 const dc=document.getElementById('dc');
+
+const map=L.map('map',{zoomControl:true}).setView([48.8,2.3],5);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>',
+  maxZoom:19
+}).addTo(map);
+(function initSplits(){
+  const main=document.querySelector('main');
+  function drag(el, vertical, cb){
+    let active=false;
+    el.addEventListener('mousedown',e=>{e.preventDefault();active=true;el.classList.add('active');});
+    document.addEventListener('mousemove',e=>{if(!active)return;cb(e,vertical);});
+    document.addEventListener('mouseup',()=>{active=false;el.classList.remove('active');map.invalidateSize();});
+  }
+  drag(document.getElementById('split-v'),true,(e)=>{
+    const rect=main.getBoundingClientRect();
+    const x=Math.max(200,Math.min(e.clientX-rect.left,rect.width-200));
+    main.style.setProperty('--right-w',(rect.width-x)+'px');
+  });
+  drag(document.getElementById('split-h'),false,(e)=>{
+    const rp=document.getElementById('right-pane');
+    const rect=rp.getBoundingClientRect();
+    const y=Math.max(80,Math.min(e.clientY-rect.top,rect.height-60));
+    rp.style.setProperty('--list-h',((y/rect.height)*100)+'%');
+  });
+})();
+const markers={};
+const MARKER_COLORS={
+  'position':'#3fb950','mic-e':'#ff79c6','weather':'#bc8cff',
+  'object':'#d29922','item':'#d29922','status':'#58a6ff',
+  'message':'#8b949e','telemetry':'#8b949e','nmea':'#8b949e'
+};
+function markerColor(typ){return MARKER_COLORS[typ]||'#8b949e';}
+function addMarker(p){
+  if(!p.aprs||!p.aprs.position)return;
+  const lat=p.aprs.position.lat,lon=p.aprs.position.lon;
+  if(isNaN(lat)||isNaN(lon))return;
+  if(markers[p.id]){markers[p.id].setLatLng([lat,lon]);return;}
+  const color=markerColor(p.aprs.type);
+  const m=L.circleMarker([lat,lon],{radius:6,color:'#fff',weight:1.5,fillColor:color,fillOpacity:.85}).addTo(map);
+  m.bindPopup('<b>'+esc(p.source||'?')+'</b><br>'+esc(p.aprs.type)+'<br>'+lat.toFixed(4)+' '+lon.toFixed(4));
+  m.on('click',()=>inspect(p.id));
+  markers[p.id]=m;
+  const ids=Object.keys(markers).map(Number);
+  if(ids.length>MAX){
+    ids.sort((a,b)=>a-b);
+    for(let i=0;i<ids.length-MAX;i++){map.removeLayer(markers[ids[i]]);delete markers[ids[i]];}
+  }
+}
+function fitMap(){
+  const pts=[];
+  for(const k in markers)pts.push(markers[k].getLatLng());
+  if(pts.length>0){
+    const bounds=L.latLngBounds(pts);
+    if(pts.length===1)map.setView(bounds.getCenter(),13);
+    else map.fitBounds(bounds.pad(.1));
+  }
+}
+let fitTmr=null;
+function debounceFit(){
+  clearTimeout(fitTmr);
+  fitTmr=setTimeout(fitMap,500);
+}
 
 function connect(){
   const proto=location.protocol==='https:'?'wss:':'ws:';
@@ -549,6 +605,8 @@ function addPkt(p){
     '<td class="c-type"><span class="badge '+typ+'">'+esc(typ)+'</span></td>'+
     '<td class="c-info">'+esc(summary(p))+'</td>';
   if(selId===p.id)inspect(p.id);
+  addMarker(p);
+  debounceFit();
 }
 
 function summary(p){
@@ -625,6 +683,8 @@ function inspect(id){
   h+='<div class="sec"><div class="sec-title">Raw Frame (hex)</div>';
   h+='<div id="hex">'+fmtHex(p.raw_hex)+'</div></div>';
   dc.innerHTML=h;
+  for(const k in markers)markers[k].setStyle({radius:6,weight:1.5});
+  if(markers[id]){markers[id].setStyle({radius:10,weight:3});map.panTo(markers[id].getLatLng());}
 }
 
 function fmtHex(h){

@@ -4,7 +4,7 @@
 
 ## Requirements
 
-- Go 1.21 or newer
+- Go 1.26 or newer
 - A running Dire Wolf instance that exposes a KISS TCP port https://github.com/wb2osz/direwolf
 
 ## Run locally
@@ -54,6 +54,14 @@ wss://localhost:8443/ws
 > The WSS connection will then work automatically from that point on.
 
 The WebSocket client in the embedded UI automatically uses `wss://` when served over HTTPS.
+
+## Build all targets
+
+Build native Linux + Windows binaries for x86 and x64:
+
+```bash
+./build.sh
+```
 
 ## Build for Linux
 
