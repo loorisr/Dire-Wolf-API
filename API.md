@@ -241,6 +241,53 @@ All fields are optional — only the data actually present in the packet is incl
 
 ---
 
+## CSV Export
+
+Pass `-csv <path>` to write every received packet to a CSV file in real time. The file is flushed after each packet.
+
+### Usage
+
+```bash
+go run . -kiss localhost:8001 -api :8080 -csv packets.csv
+```
+
+### Columns
+
+| Column                | Description                                  |
+|-----------------------|----------------------------------------------|
+| `id`                  | Auto-increment packet ID                     |
+| `timestamp`           | Server receive time (RFC 3339 nanosecond)    |
+| `port`                | KISS TNC port (0-15)                         |
+| `source`              | AX.25 source callsign                        |
+| `dest`                | AX.25 destination callsign                   |
+| `via`                 | Comma-separated digipeater path              |
+| `path`                | TNC2-style path string                       |
+| `pid`                 | AX.25 PID (hex)                              |
+| `info_raw`            | Raw info field text                          |
+| `raw_hex`             | Full frame as hex                            |
+| `error`               | AX.25 decode error message                   |
+| `aprs_type`           | APRS packet type (position, weather, etc.)   |
+| `lat`, `lon`          | Latitude/Longitude (degrees)                 |
+| `symbol`              | APRS symbol table + code                     |
+| `speed_kmh`           | Speed (km/h)                                 |
+| `course_deg`          | Heading (0-360°)                             |
+| `altitude_m`          | Altitude (meters)                            |
+| `msg_addressee`       | Message destination callsign                 |
+| `msg_text`            | Message body                                 |
+| `msg_id`              | Message ID                                   |
+| `weather_temp`        | Temperature (°C)                             |
+| `weather_humidity`    | Humidity (%)                                 |
+| `weather_pressure`    | Barometric pressure (hPa)                    |
+| `weather_wind_dir`    | Wind direction (degrees)                     |
+| `weather_wind_speed`  | Sustained wind speed (km/h)                  |
+| `weather_wind_gust`   | Wind gust speed (km/h)                       |
+| `weather_rain_hour`   | Rain last hour (mm)                          |
+| `weather_rain_day`    | Rain last 24 hours (mm)                      |
+| `status`              | Status text                                  |
+| `comment`             | Free-text comment                            |
+
+---
+
 ## CORS
 
 All JSON endpoints set `Access-Control-Allow-Origin: *`, allowing cross-origin requests from any host.

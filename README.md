@@ -22,6 +22,7 @@ Flags:
 - `-kiss`: Dire Wolf KISS TCP address, default `localhost:8001`
 - `-api`: HTTP listen address, default `:8080`
 - `-max`: maximum packets kept in memory, default `1000`
+- `-csv`: CSV output file path (e.g. `packets.csv`), disabled if empty
 - `-tls`: HTTPS/WSS listen address (e.g. `:8443`), disabled if empty
 - `-cert`: TLS certificate file; if omitted a self-signed certificate is generated automatically
 - `-key`: TLS private key file; if omitted a self-signed certificate is generated automatically
