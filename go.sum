@@ -2,3 +2,5 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/hessu/go-aprs-fap v0.0.12 h1:CPYcsm52k8iiCmN8/mKGbdBF7OV7aC9Cg8SoaeaGgeE=
 github.com/hessu/go-aprs-fap v0.0.12/go.mod h1:ijCZO2LBfaOgvcCjmV086Z3ku8dVh7lH40IXiARWmuM=
+github.com/hessu/go-aprs-fap v0.1.1 h1:jrYnPjax3CCX6CfT/3cZDM+wuarIAx5uS4TtGdgnHzc=
+github.com/hessu/go-aprs-fap v0.1.1/go.mod h1:ijCZO2LBfaOgvcCjmV086Z3ku8dVh7lH40IXiARWmuM=
