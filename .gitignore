@@ -1,0 +1,8 @@
+# Local configuration, may contain the backend token.
+/direwolf-api.json
+/config.json
+
+# Forwarding spool and local build output.
+/forward-spool/
+/direwolf_api
+/direwolf_api.exe

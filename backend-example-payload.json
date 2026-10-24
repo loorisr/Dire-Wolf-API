@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "event_id": "018f4c1e-6a9b-7c2d-8e3f-4a5b6c7d8e9f",
+  "seq": 42,
+  "node_id": "fr-paris-1",
+  "packet": {
+    "id": 42,
+    "timestamp": "2026-05-06T18:02:30.123456789Z",
+    "port": 0,
+    "raw_hex": "82a0a4a64040609c608682989860ae92888a62406303f021343835302e35304e2f30303231382e3230452d736d6f6b65206f6e65",
+    "source": "N0CALL",
+    "dest": "APRS",
+    "via": "WIDE1-1",
+    "path": "N0CALL>APRS,WIDE1-1",
+    "pid": 240,
+    "info_raw": "!4850.50N/00218.20E-smoke one",
+    "aprs": {
+      "type": "position",
+      "position": {
+        "lat": 48.84166666666667,
+        "lon": 2.3033333333333332,
+        "symbol": "/-",
+        "comment": "smoke one"
+      },
+      "comment": "smoke one",
+      "raw": "!4850.50N/00218.20E-smoke one"
+    }
+  }
+}

@@ -47,10 +47,11 @@ type Packet struct {
 
 // Stats holds aggregate counters exposed via GET /api/stats.
 type Stats struct {
-	TotalPackets int64     `json:"total_packets"`
-	TotalErrors  int64     `json:"total_errors"`
-	StartTime    time.Time `json:"start_time"`
-	Uptime       string    `json:"uptime"`
+	TotalPackets int64        `json:"total_packets"`
+	TotalErrors  int64        `json:"total_errors"`
+	StartTime    time.Time    `json:"start_time"`
+	Uptime       string       `json:"uptime"`
+	Forward      ForwardStats `json:"forward"`
 }
 
 // Server is the combined HTTP REST + WebSocket server.
@@ -81,6 +82,8 @@ type Server struct {
 	csvMu     sync.Mutex
 	csvWriter *csv.Writer
 	csvFile   *os.File
+
+	forwarder *Forwarder
 }
 
 // NewServer creates a Server. If csvPath is non-empty, a CSV file is created
@@ -116,6 +119,12 @@ func NewServer(addr, tlsAddr, certFile, keyFile string, maxPackets int, csvPath 
 	}
 
 	return s
+}
+
+// SetForwarder attaches the optional packet forwarder. It must be called
+// before Start so ingest never observes a partially configured server.
+func (s *Server) SetForwarder(f *Forwarder) {
+	s.forwarder = f
 }
 
 // csvHeader returns the column names for the CSV output file.
@@ -364,6 +373,9 @@ func (s *Server) ingest(frame KISSFrame) {
 
 	s.writeCSV(pkt)
 	s.broadcast(pkt)
+	if s.forwarder != nil {
+		s.forwarder.Enqueue(pkt)
+	}
 }
 
 // broadcast JSON-marshals a packet and sends it to every connected WebSocket
@@ -481,12 +493,17 @@ func (s *Server) handlePacket(w http.ResponseWriter, r *http.Request) {
 // GET /api/stats — aggregate packet counters and uptime.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	uptime := time.Since(s.startTime)
+	forward := DisabledForwardStats()
+	if s.forwarder != nil {
+		forward = s.forwarder.Stats()
+	}
 	jsonHeader(w)
 	json.NewEncoder(w).Encode(Stats{
 		TotalPackets: atomic.LoadInt64(&s.total),
 		TotalErrors:  atomic.LoadInt64(&s.errors),
 		StartTime:    s.startTime,
 		Uptime:       uptime.Round(time.Second).String(),
+		Forward:      forward,
 	})
 }
 
@@ -565,10 +582,13 @@ const indexHTML = `<!DOCTYPE html>
 body{font-family:'Courier New',monospace;background:#0d1117;color:#c9d1d9;height:100vh;display:flex;flex-direction:column}
 header{background:#161b22;border-bottom:1px solid #30363d;padding:10px 16px;display:flex;align-items:center;gap:12px;flex-shrink:0}
 header h1{font-size:1.1em;color:#58a6ff}
-#badge{padding:3px 10px;border-radius:12px;font-size:.78em;font-weight:700}
+#badge,#fwd-badge{padding:3px 10px;border-radius:12px;font-size:.78em;font-weight:700}
 .connected{background:#1a4731;color:#3fb950}
 .connecting{background:#3d2f00;color:#d29922}
 .disconnected{background:#3d0000;color:#f85149}
+.degraded{background:#3d2f00;color:#d29922}
+.disabled{background:#21262d;color:#8b949e}
+.unauthorized{background:#3d0000;color:#f85149}
 .hdr-stats{display:flex;gap:16px;font-size:.8em;color:#8b949e;margin-left:auto}
 .hdr-stats b{color:#c9d1d9}
 main{display:flex;flex:1;min-height:0;--right-w:360px;--list-h:55%}
@@ -594,6 +614,7 @@ main{display:flex;flex:1;min-height:0;--right-w:360px;--list-h:55%}
 <header>
   <h1>&#x1F43A; Direwolf API</h1>
   <span id="badge" class="disconnected">Disconnected</span>
+  <span id="fwd-badge" class="disabled" title="">Backend: disabled</span>
   <div class="hdr-stats">
     <span>Packets: <b id="s-total">0</b></span>
     <span>Errors: <b id="s-err">0</b></span>
@@ -627,6 +648,7 @@ const MAX=300;
 let db={};
 let selId=null;
 const badge=document.getElementById('badge');
+const fwdBadge=document.getElementById('fwd-badge');
 const tbody=document.getElementById('tbody');
 const dc=document.getElementById('dc');
 
@@ -824,10 +846,26 @@ function refreshStats(){
     document.getElementById('s-total').textContent=s.total_packets;
     document.getElementById('s-err').textContent=s.total_errors;
     document.getElementById('s-up').textContent=s.uptime;
-  });
+    refreshForwardBadge(s.forward);
+  }).catch(()=>{});
+}
+
+function refreshForwardBadge(f){
+  if(!f||!f.enabled){
+    fwdBadge.className='disabled';
+    fwdBadge.textContent='Backend: disabled';
+    fwdBadge.title='';
+    return;
+  }
+  const cls={connected:'connected',starting:'connecting',degraded:'degraded',
+             disconnected:'disconnected',unauthorized:'unauthorized'}[f.state]||'disconnected';
+  fwdBadge.className=cls;
+  fwdBadge.textContent='Backend: '+f.state+(f.pending>0?' \u00b7 '+f.pending+' queued':'');
+  fwdBadge.title=f.last_error||'';
 }
 
 connect();
+refreshStats();
 setInterval(refreshStats,5000);
 </script>
 </body>

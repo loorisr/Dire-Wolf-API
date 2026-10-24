@@ -5,36 +5,53 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
+	"strings"
 	"syscall"
 )
 
 func main() {
-	kissAddr := flag.String("kiss", "localhost:8001", "Direwolf KISS TCP address")
-	apiAddr := flag.String("api", ":8080", "API listen address")
-	tlsAddr := flag.String("tls", "", "HTTPS/WSS listen address (e.g. :8443), disabled if empty")
-	certFile := flag.String("cert", "", "TLS certificate file (auto-generated if empty)")
-	keyFile := flag.String("key", "", "TLS private key file (auto-generated if empty)")
-	maxPackets := flag.Int("max", 1000, "Max packets to keep in memory")
-	csvPath := flag.String("csv", "", "CSV output file path (disabled if empty)")
-	flag.Parse()
+	loaded, err := loadConfig(os.Args[1:], os.Getenv)
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	if err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
+	cfg := loaded.Config
 
 	log.Printf("Direwolf API Bridge")
-	log.Printf("  KISS address : %s", *kissAddr)
-	log.Printf("  API address  : %s", *apiAddr)
-	if *tlsAddr != "" {
-		log.Printf("  TLS address  : %s (cert=%s, key=%s)", *tlsAddr, *certFile, *keyFile)
+	if loaded.Meta.Path != "" {
+		log.Printf("  Config file  : %s", loaded.Meta.Path)
 	}
-	log.Printf("  Max packets  : %d", *maxPackets)
-	if *csvPath != "" {
-		log.Printf("  CSV output   : %s", *csvPath)
+	log.Printf("  KISS address : %s", cfg.KISS)
+	log.Printf("  API address  : %s", cfg.API)
+	if cfg.TLS != "" {
+		log.Printf("  TLS address  : %s (cert=%s, key=%s)", cfg.TLS, cfg.Cert, cfg.Key)
+	}
+	log.Printf("  Max packets  : %d", cfg.MaxPackets)
+	if cfg.CSV != "" {
+		log.Printf("  CSV output   : %s", cfg.CSV)
+	}
+	if cfg.Forward.URL != "" {
+		log.Printf("  Forward      : %s (node=%s, spool=%s)", cfg.Forward.URL, cfg.Forward.NodeID, cfg.Forward.SpoolDir)
+		log.Printf("  Forward auth : token from %s", loaded.Meta.TokenSource)
+		if cfg.Forward.HealthURL != "" {
+			log.Printf("  Forward check: %s every %s", cfg.Forward.HealthURL, cfg.Forward.HealthInterval.Std())
+		}
+		warnConfigPermissions(loaded)
+	} else {
+		log.Printf("  Forward      : disabled")
 	}
 
 	// Graceful shutdown on SIGINT / SIGTERM.
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -44,14 +61,57 @@ func main() {
 		cancel()
 	}()
 
+	// Packet forwarder (optional).
+	var forwarder *Forwarder
+	if cfg.Forward.URL != "" {
+		forwarder, err = NewForwarder(cfg.Forward)
+		if err != nil {
+			log.Fatalf("forwarding setup failed: %v", err)
+		}
+		forwarder.Start(ctx)
+	}
+
 	// Wire up KISS client and HTTP API server.
-	kissClient := NewClient(*kissAddr)
-	server := NewServer(*apiAddr, *tlsAddr, *certFile, *keyFile, *maxPackets, *csvPath, kissClient)
+	kissClient := NewClient(cfg.KISS)
+	server := NewServer(cfg.API, cfg.TLS, cfg.Cert, cfg.Key, cfg.MaxPackets, cfg.CSV, kissClient)
+	if forwarder != nil {
+		server.SetForwarder(forwarder)
+	}
 
 	kissClient.Start(ctx)
 
-	log.Printf("Web UI: http://localhost%s", *apiAddr)
-	if err := server.Start(ctx); err != nil {
-		log.Fatal(err)
+	log.Printf("Web UI: http://%s", uiAddress(cfg.API))
+	startErr := server.Start(ctx)
+
+	if forwarder != nil {
+		if err := forwarder.Close(); err != nil {
+			log.Printf("[FWD] shutdown: %v", err)
+		}
+	}
+	if startErr != nil {
+		log.Fatal(startErr)
+	}
+}
+
+// uiAddress renders a clickable address for the startup log.
+func uiAddress(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "localhost" + addr
+	}
+	return addr
+}
+
+// warnConfigPermissions warns when a hand-edited config file holding the
+// forwarding token is readable by group or others.
+func warnConfigPermissions(loaded LoadedConfig) {
+	if loaded.Meta.Path == "" || loaded.Meta.TokenSource != "config" || runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(loaded.Meta.Path)
+	if err != nil {
+		return
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		log.Printf("[CONFIG] warning: %s contains the forwarding token and is readable by group/others; chmod 600 is recommended", loaded.Meta.Path)
 	}
 }

@@ -1,0 +1,475 @@
+openapi: 3.0.3
+info:
+  title: Dire Wolf API — packet forwarding backend
+  version: 1.0.0
+  description: |
+    Contract for the backend that receives packets forwarded by the Dire Wolf
+    API bridge (`direwolf_api`).
+
+    Implementation requirements:
+
+    1. Authenticate `Authorization: Bearer <token>` on every endpoint.
+    2. Enforce a unique constraint on `(node_id, event_id)`. The bridge delivers
+       at-least-once and will replay packets after a crash or a backend outage.
+       Return `2xx` or `409` for a duplicate.
+    3. Return `400` or `422` only for packets that can never be stored. The
+       bridge moves those to `deadletter.ndjson` and stops retrying them.
+    4. Return `5xx`, `408` or `429` for temporary failures. The bridge keeps the
+       packet in its spool and retries with exponential backoff. `Retry-After`
+       is honored.
+    5. Expose `GET /v1/health` (or any URL configured as `forward.health_url`)
+       returning `2xx` when the service is ready. This drives the backend badge
+       in the web UI.
+    6. Store `packet.timestamp` (edge receive time) and optionally your own
+       receive time. `packet.raw_hex` is the original AX.25 frame and is present
+       even when AX.25 decoding failed.
+
+    The body is authoritative. The `Idempotency-Key` header is a convenience
+    copy of `<node_id>:<event_id>`; use the body fields for the unique key.
+  license:
+    name: GPL-2.0
+    url: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+servers:
+  - url: https://api.example.org
+    description: Replace with your backend URL
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/packets:
+    post:
+      summary: Accept one forwarded packet
+      description: |
+        Called once per received packet. The bridge sends packets in spool
+        order, one request at a time, and retries the same `event_id` until it
+        receives a `2xx` or `409`.
+      operationId: ingestPacket
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Convenience copy of `<node_id>:<event_id>`.
+          schema:
+            type: string
+            example: fr-paris-1:018f4c1e-6a9b-7c2d-8e3f-4a5b6c7d8e9f
+        - name: User-Agent
+          in: header
+          required: false
+          schema:
+            type: string
+            example: direwolf-api/1.0
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForwardEnvelope'
+            examples:
+              aprsPosition:
+                summary: APRS position report
+                value:
+                  schema_version: 1
+                  event_id: 018f4c1e-6a9b-7c2d-8e3f-4a5b6c7d8e9f
+                  seq: 42
+                  node_id: fr-paris-1
+                  packet:
+                    id: 42
+                    timestamp: '2026-05-06T18:02:30.123456789Z'
+                    port: 0
+                    raw_hex: 82a0a4a64040609c608682989860ae92888a62406303f021343835302e35304e2f30303231382e3230452d736d6f6b65206f6e65
+                    source: N0CALL
+                    dest: APRS
+                    via: WIDE1-1
+                    path: N0CALL>APRS,WIDE1-1
+                    pid: 240
+                    info_raw: '!4850.50N/00218.20E-smoke one'
+                    aprs:
+                      type: position
+                      position:
+                        lat: 48.84166666666667
+                        lon: 2.3033333333333332
+                        symbol: /-
+                        comment: smoke one
+                      comment: smoke one
+                      raw: '!4850.50N/00218.20E-smoke one'
+              undecodableFrame:
+                summary: Frame that failed AX.25 decoding
+                value:
+                  schema_version: 1
+                  event_id: 1c0f8f6e-8d0a-4a3b-9f39-0e3e1a2b3c4d
+                  seq: 43
+                  node_id: fr-paris-1
+                  packet:
+                    id: 43
+                    timestamp: '2026-05-06T18:02:31Z'
+                    port: 0
+                    raw_hex: '8288'
+                    error: 'AX.25: frame too short: 2 bytes'
+      responses:
+        '200':
+          description: Packet stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+        '201':
+          description: Packet stored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+        '202':
+          description: Packet accepted for asynchronous processing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+        '204':
+          description: Packet stored, no response body.
+        '400':
+          description: Malformed request. The bridge dead-letters the packet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid bearer token. The bridge keeps the packet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Token is not allowed to ingest. The bridge keeps the packet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Duplicate `(node_id, event_id)`. Treated as acknowledged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Semantically invalid packet. The bridge dead-letters it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limited. The bridge retries and honors `Retry-After`.
+          headers:
+            Retry-After:
+              description: Delay in seconds or an HTTP date.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Temporary server failure. The bridge retries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Service unavailable. The bridge retries and honors `Retry-After`.
+          headers:
+            Retry-After:
+              description: Delay in seconds or an HTTP date.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/health:
+    get:
+      summary: Backend health check
+      description: |
+        Polled every `forward.health_interval` (default 30s) with the same
+        Bearer token. Any `2xx` means reachable, `401`/`403` means the token is
+        rejected, anything else means the backend is down. No packet is sent by
+        this endpoint and it never affects the local spool.
+      operationId: health
+      responses:
+        '200':
+          description: Backend ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '401':
+          description: Missing or invalid bearer token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Token not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Shared token from `DIREWOLF_FORWARD_TOKEN` or `forward.token`.
+
+  schemas:
+    ForwardEnvelope:
+      type: object
+      description: One forwarded packet.
+      required:
+        - schema_version
+        - event_id
+        - seq
+        - node_id
+        - packet
+      properties:
+        schema_version:
+          type: integer
+          enum: [1]
+        event_id:
+          type: string
+          format: uuid
+          description: |
+            Generated before the packet is written to the spool. Stable across
+            retries and restarts. Use it with `node_id` as the unique key.
+        seq:
+          type: integer
+          format: int64
+          description: Local spool sequence. Informational only; restarts at 1.
+        node_id:
+          type: string
+          description: Station identifier configured with `forward.node_id`.
+        packet:
+          $ref: '#/components/schemas/Packet'
+
+    Packet:
+      type: object
+      description: |
+        Same object as `GET /api/packets` in the bridge. Only `id`, `timestamp`,
+        `port` and `raw_hex` are always present. When AX.25 decoding fails,
+        `error` is set and the callsign/APRS fields are absent.
+      required:
+        - id
+        - timestamp
+        - port
+        - raw_hex
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: Local auto-increment ID. Not stable across restarts.
+        timestamp:
+          type: string
+          format: date-time
+          description: Edge receive time (RFC 3339).
+        port:
+          type: integer
+          minimum: 0
+          maximum: 15
+          description: KISS TNC port.
+        raw_hex:
+          type: string
+          description: Raw AX.25 frame bytes, hex encoded.
+        source:
+          type: string
+          example: N0CALL
+        dest:
+          type: string
+          example: APRS
+        via:
+          type: string
+          description: Comma-separated digipeater path. `*` means already forwarded.
+          example: WIDE1-1*
+        path:
+          type: string
+          description: TNC2-style path.
+          example: N0CALL>APRS,WIDE1-1*
+        pid:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: AX.25 PID byte. Omitted when zero.
+        info_raw:
+          type: string
+          description: Raw AX.25 information field.
+        aprs:
+          $ref: '#/components/schemas/APRSPacket'
+        error:
+          type: string
+          description: AX.25 decoding error. Empty when decoding succeeded.
+
+    APRSPacket:
+      type: object
+      required:
+        - type
+        - raw
+      properties:
+        type:
+          type: string
+          enum:
+            - position
+            - message
+            - status
+            - object
+            - item
+            - weather
+            - telemetry
+            - nmea
+            - mic-e
+            - unknown
+        timestamp:
+          type: string
+          format: date-time
+          description: Timestamp carried by the APRS packet, if any.
+        position:
+          $ref: '#/components/schemas/Position'
+        message:
+          $ref: '#/components/schemas/Message'
+        weather:
+          $ref: '#/components/schemas/Weather'
+        status:
+          type: string
+        telemetry:
+          type: string
+          example: seq=1 bits=11110000 v1=12.5 v2=-
+        comment:
+          type: string
+        raw:
+          type: string
+          description: Raw APRS information field.
+
+    Position:
+      type: object
+      required:
+        - lat
+        - lon
+        - symbol
+      properties:
+        lat:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+        lon:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+        symbol:
+          type: string
+          description: Two characters, symbol table plus code.
+          example: /-
+        speed:
+          type: number
+          format: double
+          description: Speed in km/h.
+        course:
+          type: integer
+          description: Heading in degrees.
+          minimum: 0
+          maximum: 360
+        altitude:
+          type: number
+          format: double
+          description: Altitude in metres.
+        comment:
+          type: string
+
+    Message:
+      type: object
+      required:
+        - addressee
+      properties:
+        addressee:
+          type: string
+        text:
+          type: string
+        msg_id:
+          type: string
+        is_ack:
+          type: boolean
+        is_rej:
+          type: boolean
+
+    Weather:
+      type: object
+      description: All fields are optional; only data present in the packet is sent.
+      properties:
+        wind_dir:
+          type: integer
+          minimum: 0
+          maximum: 360
+        wind_speed:
+          type: number
+          format: double
+          description: km/h.
+        wind_gust:
+          type: number
+          format: double
+          description: km/h.
+        temp:
+          type: number
+          format: double
+          description: Degrees Celsius.
+        rain_hour:
+          type: number
+          format: double
+          description: Millimetres in the last hour.
+        rain_day:
+          type: number
+          format: double
+          description: Millimetres in the last 24 hours.
+        humidity:
+          type: integer
+          minimum: 0
+          maximum: 100
+        pressure:
+          type: number
+          format: double
+          description: hPa.
+
+    Ack:
+      type: object
+      properties:
+        accepted:
+          type: integer
+          minimum: 0
+        duplicates:
+          type: integer
+          minimum: 0
+
+    Health:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+        detail:
+          type: string

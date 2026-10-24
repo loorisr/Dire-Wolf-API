@@ -1,0 +1,24 @@
+{
+  "kiss": "localhost:8001",
+  "api": ":8080",
+  "tls": "",
+  "cert": "",
+  "key": "",
+  "max_packets": 1000,
+  "csv": "",
+  "forward": {
+    "url": "http://localhost:8000/v1/packets",
+    "health_url": "http://localhost:8000/v1/health",
+    "node_id": "direwolf",
+    "token": "change-me",
+    "token_file": "",
+    "spool_dir": "forward-spool",
+    "spool_max_bytes": 268435456,
+    "fsync": "always",
+    "timeout": "10s",
+    "queue": 4096,
+    "enqueue_timeout": "2s",
+    "health_interval": "30s",
+    "insecure": false
+  }
+}
