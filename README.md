@@ -1,13 +1,13 @@
 # Dire Wolf API
 
-`Dire Wolf API` is a small Go service that bridges a [Dire Wolf](https://github.com/wb2osz/direwolf) KISS TCP feed to an HTTP API and simple Web UI. It can also forward every received packet to a remote backend with a durable local spool.
+`Dire Wolf API` is a small Go service that bridges a KISS feed to an HTTP API and simple Web UI. The feed can come from [Dire Wolf](https://github.com/wb2osz/direwolf) over TCP, a serial TNC, or the Bluetooth SPP port of a radio such as the VR-N76. It can also forward every received packet to a remote backend with a durable local spool.
 
 See [API.md](API.md) for the full REST and WebSocket API documentation, including the forwarding contract.
 
 ## Requirements
 
 - Go 1.26 or newer
-- A running Dire Wolf instance that exposes a KISS TCP port https://github.com/wb2osz/direwolf
+- A KISS source: Dire Wolf exposing a KISS TCP port, a serial TNC, or a Bluetooth KISS TNC
 
 ## Run locally
 
@@ -20,7 +20,7 @@ go run . -kiss localhost:8001 -api :8080 -max 1000
 Flags:
 
 - `-config`: JSON configuration file (see below)
-- `-kiss`: Dire Wolf KISS TCP address, default `localhost:8001`
+- `-kiss`: KISS source (see below), default `localhost:8001`
 - `-api`: HTTP listen address, default `:8080`
 - `-max`: maximum packets kept in memory, default `1000`
 - `-csv`: CSV output file path (e.g. `packets.csv`), disabled if empty
@@ -45,6 +45,127 @@ When the service is running, the web UI is available at:
 ```
 http://localhost:8080
 ```
+
+## KISS sources
+
+The `-kiss` flag and the `kiss` configuration field accept several source
+formats:
+
+| Value | Transport | Platform |
+|---|---|---|
+| `localhost:8001` or `tcp://localhost:8001` | Dire Wolf KISS over TCP | Linux, Windows |
+| `serial:COM5` | Bluetooth SPP COM port or USB serial TNC | Windows |
+| `serial:/dev/ttyUSB0` | USB serial TNC | Linux |
+| `serial:/dev/rfcomm0` | RFCOMM TTY created by `rfcomm bind` | Linux |
+| `rfcomm://AA:BB:CC:DD:EE:FF` | native Bluetooth RFCOMM, explicit MAC, SDP channel discovery | Linux |
+| `rfcomm://auto` | single paired SPP device, SDP channel discovery | Linux |
+
+Serial sources use **19200 baud, 8N1** by default, which matches the VR-N76
+documentation. Override the bitrate when needed:
+
+```bash
+go run . -kiss 'serial:COM7?baud=9600'
+go run . -kiss 'serial:/dev/ttyUSB0?baud=1200'
+```
+
+### VR-N76 over Bluetooth
+
+On the radio, enable Bluetooth and set **Settings → General Settings → TNC
+Mode → KISS** before pairing. Keep the radio awake while the service is running;
+the client reconnects automatically with exponential backoff if the link drops.
+
+#### Linux (recommended: native RFCOMM)
+
+Pair and trust the radio once:
+
+```bash
+bluetoothctl
+agent on
+default-agent
+scan on
+pair 38:D2:00:AA:BB:CC
+trust 38:D2:00:AA:BB:CC
+exit
+```
+
+Then start the service. No root privileges, `rfcomm bind`, TTY or Dire Wolf
+instance are needed:
+
+```bash
+go run . -kiss 'rfcomm://38:D2:00:AA:BB:CC'
+```
+
+To avoid hardcoding the MAC, use `auto`. The client asks BlueZ for the only
+paired or connected device that exposes the Serial Port (SPP) service:
+
+```bash
+go run . -kiss 'rfcomm://auto'
+```
+
+The RFCOMM channel is discovered automatically from the SDP record
+(`sdptool search --bdaddr <MAC> SP`, with `sdptool records` as fallback). Append
+`?channel=N` to force a channel. The resolved address and channel are logged at
+connection time. If several SPP devices are paired, `auto` deliberately fails
+instead of guessing; use the MAC in that case.
+
+On the VR-N76, the SPP Dev service can be exposed on RFCOMM channel **1 or 4**.
+The client discovers the current one automatically. The link also carries the
+radio's Benshi control frames, which the client ignores as non-KISS data. If the
+SPP service is absent, the radio is almost certainly not in KISS TNC mode (or is
+asleep/out of range): select **Settings → General Settings → TNC Mode → KISS**
+and keep the service connected. A radio that is asleep/out of range or not in
+KISS mode is reported as `host is down` / `connection refused`; the client
+retries with exponential backoff.
+
+The VR-N76 may leave KISS TNC mode when the RFCOMM connection closes. Keep the
+service running continuously, or re-enable KISS mode after a disconnect.
+
+If native RFCOMM is unavailable on your BlueZ setup, create the RFCOMM TTY and
+use the serial transport instead:
+
+```bash
+sudo rfcomm bind /dev/rfcomm0 38:D2:00:AA:BB:CC 1
+go run . -kiss 'serial:/dev/rfcomm0?baud=19200'
+# later: sudo rfcomm release 0
+```
+
+Some distributions keep the radio busy with the Bluetooth headset profile and
+prevent the SPP data link from staying up. If the RFCOMM connection drops
+immediately, disable that profile in `/etc/bluetooth/input.conf`:
+
+```ini
+[General]
+Disable=Headset
+```
+
+Then restart Bluetooth (`sudo systemctl restart bluetooth`) and pair again.
+
+#### Windows (Bluetooth COM port)
+
+1. Pair the VR-N76 in **Settings → Bluetooth & devices**.
+2. Open **More Bluetooth options → COM Ports → Add**.
+3. Choose **Outgoing (computer initiates connection)**, select the VR-N76 and
+   confirm. Note the assigned port, for example `COM7`.
+4. Start the service:
+
+```powershell
+.\direwolf_api.exe -kiss "serial:COM7?baud=19200" -api :8080
+```
+
+To list Bluetooth serial ports from PowerShell:
+
+```powershell
+Get-CimInstance Win32_SerialPort |
+  Where-Object { $_.Description -like '*Bluetooth*' } |
+  Select-Object DeviceID, Description
+```
+
+`GET /api/status` shows the active source in `addr`, for example
+`rfcomm://38:d2:00:aa:bb:cc?channel=auto` or `serial:COM7?baud=19200`.
+
+For the complete VR-N76 / Direwolf test setup, RFCOMM channel discovery,
+PCH/PipeWire audio routing and VOX timing results, see
+[`docs/vr-n76-kiss-direwolf.md`](docs/vr-n76-kiss-direwolf.md).
 
 ## Configuration file
 
@@ -99,6 +220,10 @@ All durations are strings such as `"10s"` or `"500ms"`. A complete example:
   }
 }
 ```
+
+For a VR-N76, replace `kiss` with the source shown above, for example
+`"kiss": "rfcomm://auto"` (or an explicit MAC) on Linux or
+`"kiss": "serial:COM7?baud=19200"` on Windows.
 
 ### Token
 

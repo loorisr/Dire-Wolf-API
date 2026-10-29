@@ -139,7 +139,7 @@ func loadConfig(args []string, getenv func(string) string) (LoadedConfig, error)
 	def := defaultConfig()
 
 	fs := flag.NewFlagSet("direwolf-api", flag.ContinueOnError)
-	kiss := fs.String("kiss", def.KISS, "Direwolf KISS TCP address")
+	kiss := fs.String("kiss", def.KISS, "KISS source: host:port, tcp://, serial: (with optional ?baud=) or rfcomm://MAC|auto (channel auto via SDP; ?channel=N overrides)")
 	apiAddr := fs.String("api", def.API, "API listen address")
 	tlsAddr := fs.String("tls", def.TLS, "HTTPS/WSS listen address (disabled if empty)")
 	certFile := fs.String("cert", def.Cert, "TLS certificate file (auto-generated if empty)")
@@ -317,6 +317,9 @@ func resolveToken(f ForwardConfig, getenv func(string) string) (string, string, 
 func validateConfig(cfg *Config) error {
 	if cfg.API == "" {
 		return errors.New("config: api address must not be empty")
+	}
+	if _, err := parseKISSSource(cfg.KISS); err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 	if cfg.MaxPackets < 1 {
 		return errors.New("config: max_packets must be at least 1")

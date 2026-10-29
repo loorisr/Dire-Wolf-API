@@ -65,20 +65,23 @@ When forwarding is disabled, `forward` is still present with
 
 ### `GET /api/status`
 
-KISS connection state.
+KISS source connection state.
 
 **Response:**
 
 ```json
 {
   "status": "connected",
-  "addr": "localhost:8001"
+  "addr": "rfcomm://38:d2:00:aa:bb:cc?channel=auto"
 }
 ```
 
+`addr` is the normalized source: a TCP `host:port`, `serial:<device>?baud=<rate>`,
+`rfcomm://<address>?channel=<n>` or `rfcomm://auto?channel=<n>`.
+
 | `status` value    | Meaning                    |
 |--------------------|----------------------------|
-| `connected`        | KISS TCP link is up        |
+| `connected`        | KISS link is up            |
 | `connecting`       | Attempting to reconnect    |
 | `disconnected`     | No active connection       |
 

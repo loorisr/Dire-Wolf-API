@@ -1,6 +1,10 @@
+github.com/godbus/dbus/v5 v5.2.4 h1:F2gUCy++NMIxGmo9J+z5le/+ZC8W1OgeR51P4i9ZB/U=
+github.com/godbus/dbus/v5 v5.2.4/go.mod h1:3AAv2+hPq5rdnr5txxxRwiGjPXamgoIHgz9FPBfOp3c=
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
-github.com/hessu/go-aprs-fap v0.0.12 h1:CPYcsm52k8iiCmN8/mKGbdBF7OV7aC9Cg8SoaeaGgeE=
-github.com/hessu/go-aprs-fap v0.0.12/go.mod h1:ijCZO2LBfaOgvcCjmV086Z3ku8dVh7lH40IXiARWmuM=
 github.com/hessu/go-aprs-fap v0.1.1 h1:jrYnPjax3CCX6CfT/3cZDM+wuarIAx5uS4TtGdgnHzc=
 github.com/hessu/go-aprs-fap v0.1.1/go.mod h1:ijCZO2LBfaOgvcCjmV086Z3ku8dVh7lH40IXiARWmuM=
+go.bug.st/serial v1.8.0 h1:ZtnmN8aYXtPlTghwSvDWPHKBHL9TM6oFDa+KpSn4SQE=
+go.bug.st/serial v1.8.0/go.mod h1:d0MmS16Qt9b1m06yoYRNUXhRRTJV5Qg2S5EKqQtnayQ=
+golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=
+golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

@@ -235,3 +235,26 @@ func TestLoadConfigFromEnvironment(t *testing.T) {
 		t.Errorf("path = %q", loaded.Meta.Path)
 	}
 }
+
+func TestLoadConfigSerialKISSSource(t *testing.T) {
+	isolateConfigSearch(t)
+	loaded := mustLoad(t, []string{"-kiss", "serial:COM5?baud=9600"}, nil)
+	if loaded.Config.KISS != "serial:COM5?baud=9600" {
+		t.Errorf("KISS = %q", loaded.Config.KISS)
+	}
+}
+
+func TestLoadConfigInvalidKISSSource(t *testing.T) {
+	isolateConfigSearch(t)
+	for _, spec := range []string{
+		"",
+		"localhost",
+		"udp://localhost:8001",
+		"serial:",
+		"serial:COM5?baud=0",
+	} {
+		if _, err := loadConfig([]string{"-kiss", spec}, noEnv); err == nil {
+			t.Errorf("expected an error for kiss source %q", spec)
+		}
+	}
+}

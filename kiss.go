@@ -1,14 +1,24 @@
-// KISS-over-TCP client that handles reconnection with exponential backoff.
-// KISS (Keep It Simple, Stupid) is the protocol Dire Wolf uses to exchange
-// AX.25 frames over TCP (default port 8001).
+// KISS client that reads from a TCP, serial or Bluetooth RFCOMM source and
+// reconnects automatically with exponential backoff.
+//
+// KISS (Keep It Simple, Stupid) is the protocol Dire Wolf and many hardware
+// TNCs use to exchange AX.25 frames. Dire Wolf exposes it over TCP (default
+// port 8001); hardware TNCs expose it over a serial port (USB or Windows
+// Bluetooth SPP) or a native Bluetooth RFCOMM channel.
 package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"time"
+
+	"go.bug.st/serial"
 )
 
 // KISS escape bytes.
@@ -19,8 +29,15 @@ const (
 	tfesc = 0xDD // Transposed FESC (escaped FESC)
 )
 
-// Maximum exponential backoff ceiling for reconnection attempts.
-const maxBackoff = 32 * time.Second
+const (
+	// Maximum exponential backoff ceiling for reconnection attempts.
+	maxBackoff = 32 * time.Second
+	// Timeout for TCP and RFCOMM connection attempts.
+	dialTimeout = 10 * time.Second
+	// Read timeout used to notice context cancellation. Serial ports return
+	// (0, nil) after this delay; TCP and RFCOMM use a read deadline.
+	readPollInterval = 5 * time.Second
+)
 
 // KISSFrame holds a decoded KISS data frame with its source TNC port.
 type KISSFrame struct {
@@ -28,7 +45,7 @@ type KISSFrame struct {
 	Data []byte // Raw AX.25 frame payload (command byte already stripped)
 }
 
-// KISSState tracks the TCP connection lifecycle.
+// KISSState tracks the connection lifecycle.
 type KISSState int
 
 const (
@@ -37,10 +54,21 @@ const (
 	StateConnected
 )
 
-// Client maintains a KISS TCP connection to Dire Wolf, reconnecting
-// automatically on failure with exponential backoff.
+// kissConn is the subset of io.ReadCloser the KISS reader needs.
+type kissConn interface {
+	io.ReadCloser
+}
+
+// readDeadliner is implemented by net.Conn and *os.File.
+type readDeadliner interface {
+	SetReadDeadline(time.Time) error
+}
+
+// Client maintains a connection to a KISS source, reconnecting automatically
+// on failure with exponential backoff.
 type Client struct {
-	addr string
+	source KISSSource
+	addr   string
 
 	mu    sync.RWMutex
 	state KISSState
@@ -48,13 +76,18 @@ type Client struct {
 	frames chan KISSFrame // buffered output channel (capacity 256)
 }
 
-// NewClient creates a KISS client targeting the given address (host:port).
-func NewClient(addr string) *Client {
+// NewClient parses spec and creates a KISS client for it.
+func NewClient(spec string) (*Client, error) {
+	source, err := parseKISSSource(spec)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
-		addr:   addr,
+		source: source,
+		addr:   source.String(),
 		state:  StateDisconnected,
 		frames: make(chan KISSFrame, 256),
-	}
+	}, nil
 }
 
 // Start launches the reconnection loop in a background goroutine.
@@ -75,7 +108,7 @@ func (c *Client) State() KISSState {
 	return c.state
 }
 
-// Addr returns the configured remote KISS TCP address.
+// Addr returns the normalized KISS source description.
 func (c *Client) Addr() string {
 	return c.addr
 }
@@ -101,7 +134,7 @@ func (c *Client) loop(ctx context.Context) {
 		c.setState(StateConnecting)
 		log.Printf("[KISS] Connecting to %s ...", c.addr)
 
-		conn, err := net.DialTimeout("tcp", c.addr, 10*time.Second)
+		conn, err := c.dial(ctx)
 		if err != nil {
 			log.Printf("[KISS] Connection failed: %v – retry in %s", err, backoff)
 			c.setState(StateDisconnected)
@@ -121,24 +154,106 @@ func (c *Client) loop(ctx context.Context) {
 		c.setState(StateConnected)
 		log.Printf("[KISS] Connected to %s", c.addr)
 
+		// Close the connection when the context is cancelled so a blocking
+		// read cannot keep the shutdown waiting.
+		readDone := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				conn.Close()
+			case <-readDone:
+			}
+		}()
+
 		// read blocks until the connection breaks or ctx is cancelled.
 		c.read(ctx, conn)
+		close(readDone)
 
 		c.setState(StateDisconnected)
-		log.Printf("[KISS] Disconnected – reconnecting ...")
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			log.Printf("[KISS] Disconnected – reconnecting ...")
+		}
 	}
 }
 
-// read processes bytes from the TCP connection and emits complete KISS frames
-// after unescaping. A 5 s read deadline is set so context cancellation can
-// interrupt blocking reads.
-func (c *Client) read(ctx context.Context, conn net.Conn) {
+// dial opens the configured transport.
+func (c *Client) dial(ctx context.Context) (kissConn, error) {
+	switch c.source.Kind {
+	case SourceTCP:
+		d := net.Dialer{Timeout: dialTimeout}
+		return d.DialContext(ctx, "tcp", c.source.Addr)
+	case SourceSerial:
+		return dialSerial(c.source)
+	case SourceRFCOMM:
+		mac := c.source.BDAddr
+		if c.source.Auto {
+			resolved, label, err := resolveAutoRFCOMM()
+			if err != nil {
+				return nil, err
+			}
+			if label != "" {
+				log.Printf("[KISS] auto-selected %s (%s)", resolved, label)
+			} else {
+				log.Printf("[KISS] auto-selected %s", resolved)
+			}
+			mac = resolved
+		}
+
+		channel := c.source.Channel
+		if channel == 0 {
+			discovered, err := discoverSPPChannel(mac)
+			if err != nil {
+				log.Printf("[KISS] SPP channel discovery failed: %v – using channel 1", err)
+				channel = 1
+			} else {
+				log.Printf("[KISS] SPP channel %d", discovered)
+				channel = discovered
+			}
+		}
+		return dialRFCOMM(mac, channel, dialTimeout)
+	default:
+		return nil, fmt.Errorf("unsupported KISS source %q", c.addr)
+	}
+}
+
+// dialSerial opens a serial port. On Windows this is normally the outgoing
+// Bluetooth COM port created by the SPP profile; on Linux it can be a USB
+// serial TNC or /dev/rfcomm0.
+func dialSerial(source KISSSource) (kissConn, error) {
+	mode := &serial.Mode{
+		BaudRate: source.Baud,
+		DataBits: 8,
+		Parity:   serial.NoParity,
+		StopBits: serial.OneStopBit,
+	}
+	port, err := serial.Open(source.Device, mode)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", source.Device, err)
+	}
+	if err := port.SetReadTimeout(readPollInterval); err != nil {
+		port.Close()
+		return nil, fmt.Errorf("configure %s: %w", source.Device, err)
+	}
+	return port, nil
+}
+
+// read processes bytes from the KISS connection and emits complete frames
+// after unescaping. It checks the context every readPollInterval so shutdown
+// stays responsive even when no data is arriving.
+func (c *Client) read(ctx context.Context, conn kissConn) {
 	defer conn.Close()
 
 	buf := make([]byte, 4096)
 	var frame []byte // accumulating frame buffer
 	inFrame := false // true between FEND markers
 	escaped := false // true after receiving FESC
+
+	if d, ok := conn.(readDeadliner); ok {
+		_ = d.SetReadDeadline(time.Now().Add(readPollInterval))
+	}
 
 	for {
 		select {
@@ -147,14 +262,26 @@ func (c *Client) read(ctx context.Context, conn net.Conn) {
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		n, err := conn.Read(buf)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			if isTimeout(err) {
+				if d, ok := conn.(readDeadliner); ok {
+					_ = d.SetReadDeadline(time.Now().Add(readPollInterval))
+				}
 				continue
+			}
+			if ctx.Err() != nil {
+				return
 			}
 			log.Printf("[KISS] Read error: %v", err)
 			return
+		}
+		if n == 0 {
+			// Serial ports return (0, nil) on their read timeout.
+			if d, ok := conn.(readDeadliner); ok {
+				_ = d.SetReadDeadline(time.Now().Add(readPollInterval))
+			}
+			continue
 		}
 
 		for _, b := range buf[:n] {
@@ -191,7 +318,20 @@ func (c *Client) read(ctx context.Context, conn net.Conn) {
 				frame = append(frame, b)
 			}
 		}
+
+		if d, ok := conn.(readDeadliner); ok {
+			_ = d.SetReadDeadline(time.Now().Add(readPollInterval))
+		}
 	}
+}
+
+// isTimeout reports whether err is a read deadline / timeout error.
+func isTimeout(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // dispatch extracts the port from the KISS command byte and sends the raw

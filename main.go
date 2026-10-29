@@ -1,6 +1,6 @@
-// Direwolf API Bridge — connects to a Dire Wolf KISS TCP feed and exposes
-// decoded AX.25/APRS packets over an HTTP REST+WebSocket API with an
-// embedded web UI.
+// Direwolf API Bridge — connects to a KISS feed (Dire Wolf over TCP, a serial
+// TNC, or a Bluetooth SPP TNC) and exposes decoded AX.25/APRS packets over an
+// HTTP REST+WebSocket API with an embedded web UI.
 package main
 
 import (
@@ -29,7 +29,7 @@ func main() {
 	if loaded.Meta.Path != "" {
 		log.Printf("  Config file  : %s", loaded.Meta.Path)
 	}
-	log.Printf("  KISS address : %s", cfg.KISS)
+	log.Printf("  KISS source  : %s", cfg.KISS)
 	log.Printf("  API address  : %s", cfg.API)
 	if cfg.TLS != "" {
 		log.Printf("  TLS address  : %s (cert=%s, key=%s)", cfg.TLS, cfg.Cert, cfg.Key)
@@ -72,7 +72,10 @@ func main() {
 	}
 
 	// Wire up KISS client and HTTP API server.
-	kissClient := NewClient(cfg.KISS)
+	kissClient, err := NewClient(cfg.KISS)
+	if err != nil {
+		log.Fatalf("KISS setup failed: %v", err)
+	}
 	server := NewServer(cfg.API, cfg.TLS, cfg.Cert, cfg.Key, cfg.MaxPackets, cfg.CSV, kissClient)
 	if forwarder != nil {
 		server.SetForwarder(forwarder)
