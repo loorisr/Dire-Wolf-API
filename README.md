@@ -222,9 +222,20 @@ wss://localhost:8443/ws
 
 The WebSocket client in the embedded UI automatically uses `wss://` when served over HTTPS.
 
+## Download
+
+Prebuilt binaries for Linux (x86, x64, arm64, armv7 / Raspberry Pi) and Windows (x86, x64) are attached to each [GitHub Release](https://github.com/loorisr/Dire-Wolf-API/releases), together with a `SHA256SUMS` file.
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) whenever a `v*` tag is pushed:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
 ## Build all targets
 
-Build native Linux + Windows binaries for x86 and x64:
+Build Linux (x86, x64, arm64, armv7) and Windows (x86, x64) binaries into `build/`:
 
 ```bash
 ./build.sh
